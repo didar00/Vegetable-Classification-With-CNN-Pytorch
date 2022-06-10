@@ -19,57 +19,64 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 
 transform = transforms.Compose([
-	transforms.Resize(size=(224, 224)),
+	transforms.Resize(size=(112, 112)),
     transforms.ToTensor()
 ])
 
 
-
 # construct the argument parser and parse the arguments
 ap = argparse.ArgumentParser()
-ap.add_argument("-m", "--model", type=str, required=True,
-	help="path to output trained model")
-ap.add_argument("-p", "--plot", type=str, required=True,
-	help="path to output loss/accuracy plot")
+ap.add_argument("--mode", type=str, required=True,
+	help="train/fine-tune")
+ap.add_argument("--batch", type=int, required=False,
+	help="batch size")
+ap.add_argument("--eta", type=float, required=False,
+	help="learning rate")
+ap.add_argument("--epoch", type=int, required=False,
+	help="learning rate")
+ap.add_argument("--dataset", type=str, required=True,
+	help="path to the dataset")
 args = vars(ap.parse_args())
-
+print(type(args["batch"]))
+print(args["batch"])
 # define training hyperparameters
 INIT_LR = 1e-3
 BATCH_SIZE = 32
-EPOCHS = 2
+EPOCHS = 100
 
-# define the train and val splits
-TRAIN_SPLIT = 0.75
-VAL_SPLIT = 1 - TRAIN_SPLIT
+if args["batch"] is not None:
+	BATCH_SIZE = args["batch"]
+if args["eta"] is not None:
+	INIT_LR = args["eta"]
+if args["epoch"] is not None:
+	EPOCHS = args["epoch"]
+
 
 # set the device we will be using to train the model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 print("[INFO] loading the dataset...")
-dataset = ImageFolder('dataset', transform=transform)
+dataset = ImageFolder(args["dataset"], transform=transform)
 # calculate the train/validation split
 print("[INFO] generating the train/validation split...")
 # transform=ToTensor() in KMNIST, is it necessary, i guess no, it is for kmnist
 (train, val, test) = random_split(dataset, [12000, 1500, 1500], generator=torch.Generator().manual_seed(42))
 
-print(train)
-print(type(train))
 
 import torch.utils.data as data_utils
 
-indices = torch.arange(450)
+indices = torch.arange(3000)
 train_subset = data_utils.Subset(train, indices)
 
-indices = torch.arange(300)
+indices = torch.arange(750)
 val_subset = data_utils.Subset(val, indices)
 
-#test_subset = data_utils.Subset(test, indices)
+test_subset = data_utils.Subset(test, indices)
 
 # initialize the train, validation, and test data loaders
 trainDataLoader = DataLoader(train_subset, shuffle=True, batch_size=BATCH_SIZE)
 valDataLoader = DataLoader(val_subset, batch_size=BATCH_SIZE)
-testDataLoader = DataLoader(test, batch_size=BATCH_SIZE)
+testDataLoader = DataLoader(test_subset, batch_size=BATCH_SIZE)
 # calculate steps per epoch for training and validation set
 trainSteps = len(trainDataLoader.dataset) // BATCH_SIZE
 valSteps = len(valDataLoader.dataset) // BATCH_SIZE
@@ -78,12 +85,27 @@ print("Dataset classes")
 print(train.dataset.classes)
 # initialize the CNN model
 print("[INFO] initializing the CNN model...")
-model = CNN(
-	numChannels=3,
-	classes=len(train.dataset.classes)).to(device)
-# initialize our optimizer and loss function
-opt = Adam(model.parameters(), lr=INIT_LR)
-lossFn = nn.NLLLoss()
+if args["mode"] == "train":
+	model = CNN(
+		numChannels=3,
+		classes=len(train.dataset.classes), residual=True).to(device)
+	# initialize our optimizer and loss function
+	opt = Adam(model.parameters(), lr=INIT_LR)
+	lossFn = nn.NLLLoss()
+elif args["mode"] == "fine-tune":
+	model = torch.hub.load('pytorch/vision:v0.10.0', 'resnet18', pretrained=True)
+	model = model.to(device)
+	plist = [
+			{'params': model.layer3.parameters(), 'lr': INIT_LR},
+			{'params': model.layer4.parameters(), 'lr': INIT_LR}
+			]
+
+	# initialize our optimizer and loss function
+	opt = Adam(plist, lr=INIT_LR)
+	lossFn = nn.NLLLoss()
+else:
+	exit(1)
+
 # initialize a dictionary to store training history
 H = {
 	"train_loss": [],
@@ -179,8 +201,75 @@ with torch.no_grad():
 		pred = model(x)
 		preds.extend(pred.argmax(axis=1).cpu().numpy())
 # generate a classification report
-print(classification_report(test_subset.targets.cpu().numpy(),
-	np.array(preds), target_names=test_subset.classes))
+
+targets = list()
+for i in range(750):
+	targets.append(test_subset.__getitem__(i)[-1])
+
+targets = torch.tensor(targets)
+preds = torch.tensor(preds)
+
+print(classification_report(np.array(targets),
+	np.array(preds), target_names=dataset.classes))
+
+stacked = torch.stack((targets, preds), dim=1)
+confusion_matrix = torch.zeros(15, 15, dtype=torch.int32)
+
+# fill in the matrix
+for row in stacked:
+    true_label, pred_label = row.numpy()
+    confusion_matrix[true_label, pred_label] += 1
+
+
+from sklearn.metrics import confusion_matrix
+
+# simply call the confusion_matrix function to build a confusion matrix
+cm = confusion_matrix(targets, preds)
+print(cm)
+
+import matplotlib.pyplot as plt
+import numpy as np
+import itertools
+
+def plot_confusion_matrix(cm, target_names, title='confusion matrix', cmap=None, normalize=False):
+    if cmap is None:
+        cmap = plt.get_cmap('Oranges')
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    
+    if target_names is not None:
+        tick_marks = np.arange(len(target_names))
+        plt.xticks(tick_marks, target_names, rotation=45)
+        plt.yticks(tick_marks, target_names)
+
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+
+    thresh = cm.max() / 1.5 if normalize else cm.max() / 2
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        if normalize:
+            plt.text(j, i, "{:0.4f}".format(cm[i, j]),
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black")
+        else:
+            plt.text(j, i, "{:,}".format(cm[i, j]),
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black")
+
+
+    plt.tight_layout()
+    plt.ylim(len(target_names)-0.5, -0.5)
+    plt.ylabel('True labels')
+    plt.xlabel('Predicted labels')
+    plt.savefig(title + '.png', dpi=500, bbox_inches = 'tight')
+    
+tt  = ['Bean', 'Bitter_Gourd', 'Bottle_Gourd', 'Brinjal', 'Broccoli', 'Cabbage', 'Capsicum', 'Carrot', 'Cauliflower', 'Cucumber', 'Papaya', 'Potato', 'Pumpkin', 'Radish', 'Tomato']
+
+plot_confusion_matrix(cm, tt)
 
 # plot the training loss and accuracy
 plt.style.use("ggplot")
@@ -193,7 +282,7 @@ plt.title("Training Loss and Accuracy on Dataset")
 plt.xlabel("Epoch #")
 plt.ylabel("Loss/Accuracy")
 plt.legend(loc="lower left")
-plt.savefig(args["plot"])
+plt.savefig("plot.png")
 # serialize the model to disk
-torch.save(model, args["model"])
+torch.save(model, "trained_model.pt")
 
